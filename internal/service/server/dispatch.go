@@ -506,9 +506,9 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 		if monitor != nil {
 			monitor.Finish()
 			if monitor.Terminal == "response.completed" {
-				log.Info("OpenAI Responses 直通流结束", "status", upstreamResp.StatusCode, "content_type", upstreamResp.Header.Get("Content-Type"), "terminal", monitor.Terminal, "bytes", monitor.Bytes)
+				log.Info("OpenAI Responses stream completed", "status", upstreamResp.StatusCode, "content_type", upstreamResp.Header.Get("Content-Type"), "terminal", monitor.Terminal, "bytes", monitor.Bytes, "monitor_truncated", monitor.Truncated)
 			} else {
-				log.Warn("OpenAI Responses 直通流未以 completed 结束", "status", upstreamResp.StatusCode, "content_type", upstreamResp.Header.Get("Content-Type"), "terminal", monitor.Terminal, "error_type", monitor.ErrorType, "error_code", monitor.ErrorCode, "error_message", monitor.ErrorMessage, "bytes", monitor.Bytes, "body_preview", monitor.Preview())
+				log.Warn("OpenAI Responses stream ended without response.completed", "status", upstreamResp.StatusCode, "content_type", upstreamResp.Header.Get("Content-Type"), "terminal", monitor.Terminal, "error_type", monitor.ErrorType, "error_code", monitor.ErrorCode, "error_message", monitor.ErrorMessage, "bytes", monitor.Bytes, "monitor_truncated", monitor.Truncated)
 			}
 		}
 
@@ -615,29 +615,33 @@ func copyUpstreamResponseBody(target io.Writer, source io.Reader, responseWriter
 	}
 }
 
+const openAIStreamMonitorMaxParseBytes = 64 * 1024
+
 type openAIStreamMonitor struct {
 	Bytes        int64
 	Terminal     string
 	ErrorType    string
 	ErrorCode    string
 	ErrorMessage string
-	preview      []byte
+	Truncated    bool
 
-	lineBuf   []byte
-	eventName string
-	dataLines []string
+	parsedBytes int
+	lineBuf     []byte
+	eventName   string
+	dataLines   []string
 }
 
 func (m *openAIStreamMonitor) Write(p []byte) (int, error) {
 	m.Bytes += int64(len(p))
-	if len(m.preview) < 2048 {
-		remaining := 2048 - len(m.preview)
-		if len(p) < remaining {
-			remaining = len(p)
-		}
-		m.preview = append(m.preview, p[:remaining]...)
-	}
 	for _, b := range p {
+		if m.Truncated {
+			continue
+		}
+		if m.parsedBytes >= openAIStreamMonitorMaxParseBytes {
+			m.truncateParsing()
+			continue
+		}
+		m.parsedBytes++
 		if b == '\n' {
 			m.processLine(string(m.lineBuf))
 			m.lineBuf = m.lineBuf[:0]
@@ -648,16 +652,22 @@ func (m *openAIStreamMonitor) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (m *openAIStreamMonitor) Preview() string {
-	return strings.TrimSpace(string(m.preview))
-}
-
 func (m *openAIStreamMonitor) Finish() {
+	if m.Truncated {
+		return
+	}
 	if len(m.lineBuf) > 0 {
 		m.processLine(string(m.lineBuf))
 		m.lineBuf = nil
 	}
 	m.finishEvent()
+}
+
+func (m *openAIStreamMonitor) truncateParsing() {
+	m.Truncated = true
+	m.lineBuf = nil
+	m.eventName = ""
+	m.dataLines = nil
 }
 
 func (m *openAIStreamMonitor) processLine(line string) {
