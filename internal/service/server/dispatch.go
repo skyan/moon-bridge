@@ -368,6 +368,7 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 
 		upstreamRequest := responsesRequest
 		upstreamRequest.Model = candidate.UpstreamModel
+		upstreamRequest.Tools = expandResponseNamespaceTools(upstreamRequest.Tools)
 		actualModel = candidate.UpstreamModel
 
 		// Inject web_search tool if enabled for this model.
@@ -487,14 +488,28 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 		shouldCapture := traceEnabled || usageEnabled
 
 		var captured bytes.Buffer
-		target := io.Writer(writer)
+		var monitor *openAIStreamMonitor
+		writers := []io.Writer{writer}
 		if shouldCapture {
-			target = io.MultiWriter(writer, &captured)
+			writers = append(writers, &captured)
 		}
-		if _, err := io.Copy(target, upstreamResp.Body); err != nil {
+		if responsesRequest.Stream {
+			monitor = &openAIStreamMonitor{}
+			writers = append(writers, monitor)
+		}
+		target := io.MultiWriter(writers...)
+		if _, err := copyUpstreamResponseBody(target, upstreamResp.Body, writer); err != nil {
 			hookErr = "copy upstream response"
 			log.Error("复制上游响应失败", "error", err)
 			return
+		}
+		if monitor != nil {
+			monitor.Finish()
+			if monitor.Terminal == "response.completed" {
+				log.Info("OpenAI Responses 直通流结束", "status", upstreamResp.StatusCode, "content_type", upstreamResp.Header.Get("Content-Type"), "terminal", monitor.Terminal, "bytes", monitor.Bytes)
+			} else {
+				log.Warn("OpenAI Responses 直通流未以 completed 结束", "status", upstreamResp.StatusCode, "content_type", upstreamResp.Header.Get("Content-Type"), "terminal", monitor.Terminal, "error_type", monitor.ErrorType, "error_code", monitor.ErrorCode, "error_message", monitor.ErrorMessage, "bytes", monitor.Bytes, "body_preview", monitor.Preview())
+			}
 		}
 
 		if traceEnabled {
@@ -550,5 +565,177 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 	)
 	if hookErr == "" {
 		hookErr = fmt.Sprintf("all %d candidates failed: %v", len(openaiCandidates), lastErr)
+	}
+}
+
+func expandResponseNamespaceTools(tools []openai.Tool) []openai.Tool {
+	if len(tools) == 0 {
+		return tools
+	}
+	expanded := make([]openai.Tool, 0, len(tools))
+	for _, tool := range tools {
+		if tool.Type == "namespace" && len(tool.Tools) > 0 {
+			expanded = append(expanded, expandResponseNamespaceTools(tool.Tools)...)
+			continue
+		}
+		if len(tool.Tools) > 0 {
+			tool.Tools = expandResponseNamespaceTools(tool.Tools)
+		}
+		expanded = append(expanded, tool)
+	}
+	return expanded
+}
+
+func copyUpstreamResponseBody(target io.Writer, source io.Reader, responseWriter http.ResponseWriter) (int64, error) {
+	buffer := make([]byte, 32*1024)
+	flusher, _ := responseWriter.(http.Flusher)
+	var written int64
+	for {
+		n, readErr := source.Read(buffer)
+		if n > 0 {
+			chunk := buffer[:n]
+			writeN, writeErr := target.Write(chunk)
+			written += int64(writeN)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if writeN != n {
+				return written, io.ErrShortWrite
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if readErr == io.EOF {
+			return written, nil
+		}
+		if readErr != nil {
+			return written, readErr
+		}
+	}
+}
+
+type openAIStreamMonitor struct {
+	Bytes        int64
+	Terminal     string
+	ErrorType    string
+	ErrorCode    string
+	ErrorMessage string
+	preview      []byte
+
+	lineBuf   []byte
+	eventName string
+	dataLines []string
+}
+
+func (m *openAIStreamMonitor) Write(p []byte) (int, error) {
+	m.Bytes += int64(len(p))
+	if len(m.preview) < 2048 {
+		remaining := 2048 - len(m.preview)
+		if len(p) < remaining {
+			remaining = len(p)
+		}
+		m.preview = append(m.preview, p[:remaining]...)
+	}
+	for _, b := range p {
+		if b == '\n' {
+			m.processLine(string(m.lineBuf))
+			m.lineBuf = m.lineBuf[:0]
+			continue
+		}
+		m.lineBuf = append(m.lineBuf, b)
+	}
+	return len(p), nil
+}
+
+func (m *openAIStreamMonitor) Preview() string {
+	return strings.TrimSpace(string(m.preview))
+}
+
+func (m *openAIStreamMonitor) Finish() {
+	if len(m.lineBuf) > 0 {
+		m.processLine(string(m.lineBuf))
+		m.lineBuf = nil
+	}
+	m.finishEvent()
+}
+
+func (m *openAIStreamMonitor) processLine(line string) {
+	line = strings.TrimSuffix(line, "\r")
+	if strings.TrimSpace(line) == "" {
+		m.finishEvent()
+		return
+	}
+	if strings.HasPrefix(line, "event:") {
+		m.eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		return
+	}
+	if strings.HasPrefix(line, "data:") {
+		m.dataLines = append(m.dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+	}
+}
+
+func (m *openAIStreamMonitor) finishEvent() {
+	if m.eventName == "" && len(m.dataLines) == 0 {
+		return
+	}
+	data := strings.Join(m.dataLines, "\n")
+	if data == "[DONE]" {
+		m.Terminal = "[DONE]"
+	} else if m.eventName == "response.completed" || m.eventName == "response.failed" || m.eventName == "error" {
+		m.Terminal = m.eventName
+		m.captureError(data)
+	} else if data != "" {
+		m.captureTerminalFromData(data)
+	}
+	m.eventName = ""
+	m.dataLines = nil
+}
+
+func (m *openAIStreamMonitor) captureTerminalFromData(data string) {
+	var payload struct {
+		Type     string             `json:"type"`
+		Error    openai.ErrorObject `json:"error"`
+		Response struct {
+			Status string              `json:"status"`
+			Error  *openai.ErrorObject `json:"error"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		return
+	}
+	switch payload.Type {
+	case "response.completed", "response.failed", "error":
+		m.Terminal = payload.Type
+		m.captureErrorFromPayload(payload.Error, payload.Response.Error)
+	}
+}
+
+func (m *openAIStreamMonitor) captureError(data string) {
+	if data == "" || data == "[DONE]" {
+		return
+	}
+	var payload struct {
+		Error    openai.ErrorObject `json:"error"`
+		Response struct {
+			Error *openai.ErrorObject `json:"error"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		return
+	}
+	m.captureErrorFromPayload(payload.Error, payload.Response.Error)
+}
+
+func (m *openAIStreamMonitor) captureErrorFromPayload(eventErr openai.ErrorObject, responseErr *openai.ErrorObject) {
+	if eventErr.Message != "" || eventErr.Type != "" || eventErr.Code != "" {
+		m.ErrorType = eventErr.Type
+		m.ErrorCode = eventErr.Code
+		m.ErrorMessage = eventErr.Message
+	}
+	if responseErr != nil && (m.ErrorMessage == "" && m.ErrorType == "" && m.ErrorCode == "") {
+		m.ErrorType = responseErr.Type
+		m.ErrorCode = responseErr.Code
+		m.ErrorMessage = responseErr.Message
 	}
 }

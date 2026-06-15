@@ -10,16 +10,17 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
+	"moonbridge/internal/config"
 	"moonbridge/internal/extension/codex"
 	deepseekv4 "moonbridge/internal/extension/deepseek_v4"
 	"moonbridge/internal/extension/plugin"
-	"moonbridge/internal/config"
+	"moonbridge/internal/format"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/protocol/openai"
-	"moonbridge/internal/format"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/server"
 	"moonbridge/internal/service/stats"
@@ -82,7 +83,6 @@ func (provider providerFunc) StreamMessage(ctx context.Context, req any) (<-chan
 	return provider.stream(ctx, req)
 }
 
-
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -93,6 +93,22 @@ type captureCompletionPlugin struct {
 	plugin.BasePlugin
 	result plugin.RequestResult
 	called bool
+}
+
+type flushRecorder struct {
+	*httptest.ResponseRecorder
+	flushes int
+}
+
+func newFlushRecorder() *flushRecorder {
+	return &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+}
+
+func (r *flushRecorder) Flush() {
+	r.flushes++
+	if r.Code == 0 {
+		r.WriteHeader(http.StatusOK)
+	}
 }
 
 func (p *captureCompletionPlugin) Name() string { return "capture_completion" }
@@ -753,6 +769,125 @@ func TestResponsesHandlerPassesOpenAIStreamUsageToMetrics(t *testing.T) {
 	}
 	if usage.NormalizedInputTokens != 90 || capture.result.InputTokens != 90 || usage.NormalizedCacheCreation != 0 {
 		t.Fatalf("normalized usage = %+v result=%+v", usage, capture.result)
+	}
+}
+
+func TestResponsesHandlerFlushesOpenAIStreamPassthrough(t *testing.T) {
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+				`event: response.created`,
+				`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+				``,
+				`event: response.completed`,
+				`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`,
+				``,
+			}, "\n"))),
+		}, nil
+	})}
+
+	providerMgr, err := provider.NewProviderManager(map[string]provider.ProviderConfig{
+		"openai": {
+			BaseURL:  "https://openai.example.test",
+			APIKey:   "openai-key",
+			Protocol: config.ProtocolOpenAIResponse,
+		},
+	}, map[string]provider.ModelRoute{
+		"gpt-direct": {Provider: "openai", Name: "gpt-upstream"},
+	})
+	if err != nil {
+		t.Fatalf("NewProviderManager() error = %v", err)
+	}
+	handler := server.New(server.Config{
+		ProviderMgr:      providerMgr,
+		OpenAIHTTPClient: httpClient,
+	})
+
+	recorder := newFlushRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(`{"model":"gpt-direct","input":"hello","stream":true}`))
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.flushes == 0 {
+		t.Fatalf("expected stream passthrough to flush writes")
+	}
+	if !strings.Contains(recorder.Body.String(), "event: response.completed") {
+		t.Fatalf("stream response missing response.completed: %s", recorder.Body.String())
+	}
+}
+
+func TestResponsesHandlerExpandsNamespaceToolsForOpenAIStreamPassthrough(t *testing.T) {
+	var upstreamRequest openai.ResponsesRequest
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(request.Body).Decode(&upstreamRequest); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+				`event: response.completed`,
+				`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`,
+				``,
+			}, "\n"))),
+		}, nil
+	})}
+
+	providerMgr, err := provider.NewProviderManager(map[string]provider.ProviderConfig{
+		"openai": {
+			BaseURL:  "https://openai.example.test",
+			APIKey:   "openai-key",
+			Protocol: config.ProtocolOpenAIResponse,
+		},
+	}, map[string]provider.ModelRoute{
+		"gpt-direct": {Provider: "openai", Name: "gpt-upstream"},
+	})
+	if err != nil {
+		t.Fatalf("NewProviderManager() error = %v", err)
+	}
+	handler := server.New(server.Config{
+		ProviderMgr:      providerMgr,
+		OpenAIHTTPClient: httpClient,
+	})
+
+	body := `{
+		"model":"gpt-direct",
+		"input":"hello",
+		"stream":true,
+		"tools":[
+			{"type":"function","name":"top_level","parameters":{"type":"object"}},
+			{"type":"namespace","name":"multi_agent_v1","tools":[
+				{"type":"function","name":"spawn_agent","parameters":{"type":"object"}},
+				{"type":"function","name":"wait_agent","parameters":{"type":"object"}}
+			]}
+		]
+	}`
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamRequest.Model != "gpt-upstream" {
+		t.Fatalf("upstream model = %q", upstreamRequest.Model)
+	}
+	if len(upstreamRequest.Tools) != 3 {
+		t.Fatalf("tools len = %d, tools = %+v", len(upstreamRequest.Tools), upstreamRequest.Tools)
+	}
+	for _, tool := range upstreamRequest.Tools {
+		if tool.Type == "namespace" {
+			t.Fatalf("namespace tool was not expanded: %+v", tool)
+		}
+	}
+	gotNames := []string{upstreamRequest.Tools[0].Name, upstreamRequest.Tools[1].Name, upstreamRequest.Tools[2].Name}
+	wantNames := []string{"top_level", "spawn_agent", "wait_agent"}
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Fatalf("tool names = %+v, want %+v", gotNames, wantNames)
 	}
 }
 
